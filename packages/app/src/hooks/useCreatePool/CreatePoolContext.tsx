@@ -231,7 +231,7 @@ export const CreatePoolProvider = ({ children }: { children: ReactNode }) => {
           // address so the UI can direct the user to the manage page to retry
           // instead of leaving them with a stranded deployed pool.
           console.error('Pool deployed but addPoolMembers failed:', addMembersError);
-          throw new PoolMembersAddError(pool.address, addMembersError);
+          throw new PoolMembersAddError(pool.address, memberAddresses, addMembersError);
         }
       }
 

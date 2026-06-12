@@ -69,6 +69,8 @@ const ReviewLaunch = () => {
   // modal that links to the manage page so the user can retry.
   const [partialCreatePoolAddress, setPartialCreatePoolAddress] = useState<string | undefined>(undefined);
   const [partialCreateReason, setPartialCreateReason] = useState<string | undefined>(undefined);
+  const [partialCreateMembers, setPartialCreateMembers] = useState<string[]>([]);
+  const [partialCopySuccess, setPartialCopySuccess] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
 
   const socials = [
@@ -100,6 +102,8 @@ const ReviewLaunch = () => {
     setErrorMessage(undefined);
     setPartialCreatePoolAddress(undefined);
     setPartialCreateReason(undefined);
+    setPartialCreateMembers([]);
+    setPartialCopySuccess(false);
 
     try {
       const pool = await createPool();
@@ -120,6 +124,7 @@ const ReviewLaunch = () => {
       if (isPoolMembersAddError(error)) {
         setPartialCreatePoolAddress(error.poolAddress);
         setPartialCreateReason(printAndParseSupportError(error.cause));
+        setPartialCreateMembers(error.memberAddresses);
       } else {
         const message = printAndParseSupportError(error);
         setErrorMessage(message);
@@ -134,6 +139,8 @@ const ReviewLaunch = () => {
   const onClosePartialCreateModal = () => {
     setPartialCreatePoolAddress(undefined);
     setPartialCreateReason(undefined);
+    setPartialCreateMembers([]);
+    setPartialCopySuccess(false);
   };
 
   const onGoToManagePool = () => {
@@ -142,6 +149,30 @@ const ReviewLaunch = () => {
     onClosePartialCreateModal();
     navigate(`/collective/${address}/manage`);
   };
+
+  const onCopyPartialMembers = useCallback(async () => {
+    if (partialCreateMembers.length === 0) return;
+    const text = partialCreateMembers.join('\n');
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+      } else {
+        // Fallback for environments without clipboard API (older webviews).
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textarea);
+      }
+      setPartialCopySuccess(true);
+      setTimeout(() => setPartialCopySuccess(false), 2000);
+    } catch (err) {
+      console.error('Failed to copy member addresses:', err);
+    }
+  }, [partialCreateMembers]);
 
   // ===== Helpers to reduce repetition =====
   const formatPoolType = useCallback((poolType?: string) => {
@@ -325,8 +356,9 @@ const ReviewLaunch = () => {
       />
 
       {/* Partial-create recovery modal: shown when the pool was deployed but
-          the second tx (adding initial members) failed. Directs the user to
-          the manage page where they can retry adding members. */}
+          the second tx (adding initial members) failed. Surfaces the attempted
+          member list with a copy-to-clipboard so the user can paste it on the
+          manage page instead of typing it again. */}
       <BaseModal
         openModal={!!partialCreatePoolAddress}
         onClose={onClosePartialCreateModal}
@@ -337,6 +369,34 @@ const ReviewLaunch = () => {
           'Your pool was deployed on-chain, but the second transaction adding the initial members did not complete.',
           partialCreateReason ? `Reason: ${partialCreateReason}` : undefined,
           partialCreatePoolAddress ? `Pool address: ${partialCreatePoolAddress}` : undefined,
+          partialCreateMembers.length > 0 ? (
+            <VStack key="member-list" space={2} width="100%" maxWidth="360px">
+              <HStack alignItems="center" justifyContent="space-between">
+                <Text fontSize="sm" fontWeight="600">
+                  Members to add ({partialCreateMembers.length})
+                </Text>
+                <Pressable onPress={onCopyPartialMembers}>
+                  <Text fontSize="sm" color="blue.500" fontWeight="600">
+                    {partialCopySuccess ? 'Copied!' : 'Copy'}
+                  </Text>
+                </Pressable>
+              </HStack>
+              <Box
+                borderWidth={1}
+                borderColor="gray.200"
+                borderRadius={8}
+                padding={2}
+                maxHeight={120}
+                overflow="scroll"
+                backgroundColor="gray.50">
+                {partialCreateMembers.map((address) => (
+                  <Text key={address} fontSize="xs" fontFamily="mono" textAlign="left">
+                    {address}
+                  </Text>
+                ))}
+              </Box>
+            </VStack>
+          ) : undefined,
           'You can finish adding members from the pool management page.',
         ]}
         image={PhoneImg}
