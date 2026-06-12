@@ -454,7 +454,8 @@ const ManageCollectivePage = () => {
                     onChangeText={memberManagement.setMemberInput}
                     autoCapitalize="none"
                     borderRadius={8}
-                    h={120}
+                    minH={120}
+                    totalLines={4}
                   />
                   <Text fontSize="xs" color="gray.500">
                     {memberManagement.parsedMemberAddresses.length > 0
