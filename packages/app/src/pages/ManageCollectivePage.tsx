@@ -74,7 +74,6 @@ const ManageCollectivePage = () => {
     poolAddress,
     pooltype,
     chainId,
-    initialMembers: collective?.stewardCollectives,
   });
 
   if (!collective) {

@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { GoodCollectiveSDK } from '@gooddollar/goodcollective-sdk';
 import { useEthersProvider, useEthersSigner } from '../useEthers';
 import { SupportedNetwork, SupportedNetworkNames } from '../../models/constants';
-import { StewardCollective } from '../../models/models';
 import {
   assessPoolMemberEligibility,
   formatSkippedMembersMessage,
@@ -19,19 +18,9 @@ interface UseMemberManagementParams {
   poolAddress?: string;
   pooltype?: string;
   chainId: number;
-  /**
-   * Initial member list from the subgraph (collective.stewardCollectives).
-   * Used as the source of truth for steady state; the hook only goes on-chain
-   * via sdk.getUBIPoolMembers for an immediate refresh after the user's own
-   * add/remove tx, since the subgraph takes a few seconds to index events.
-   */
-  initialMembers?: StewardCollective[];
 }
 
-const toMemberAddresses = (stewards: StewardCollective[] | undefined): string[] =>
-  stewards?.map((s) => s.steward.toLowerCase()) ?? [];
-
-export const useMemberManagement = ({ poolAddress, pooltype, chainId, initialMembers }: UseMemberManagementParams) => {
+export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMemberManagementParams) => {
   const provider = useEthersProvider({ chainId });
   const signer = useEthersSigner({ chainId });
 
@@ -48,41 +37,53 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId, initialMem
   const [isAddingMembers, setIsAddingMembers] = useState(false);
   const [removingMemberAddress, setRemovingMemberAddress] = useState<string | null>(null);
 
-  const subgraphMembers = useMemo(() => toMemberAddresses(initialMembers), [initialMembers]);
+  const [managedMembers, setManagedMembers] = useState<string[]>([]);
+  const [totalMemberCount, setTotalMemberCount] = useState<number | null>(null);
+  const [isLoadingMembers, setIsLoadingMembers] = useState(false);
 
-  // Steady-state member list seeded from the subgraph. Add/remove flows update
-  // this locally (and refresh from chain for UBI) so the UI stays in sync
-  // between subgraph polls.
-  const [managedMembers, setManagedMembers] = useState<string[]>(subgraphMembers);
-  const [totalMemberCount, setTotalMemberCount] = useState<number | null>(
-    initialMembers ? initialMembers.length : null
-  );
+  // Membership is sourced from sdk.getUBIPoolMembers, which scans MEMBER_ROLE
+  // grant/revoke events on the pool contract. We can't use the subgraph here
+  // because the subgraph's StewardCollective entity only tracks claim history
+  // (see packages/subgraph/src/mappings/ubipool.ts handleUBIClaim) - members
+  // who haven't claimed yet aren't in it, and members who were removed but
+  // claimed in the past would stay in it. Membership truth lives on-chain.
+  //
+  // The SDK helper still has the ~9500-block scan window inherited from RPC
+  // limits, but that's a single canonical implementation in the SDK rather
+  // than a duplicated one here. Improving that window is the SDK's concern.
+  const loadMembersFromChain = useCallback(async (): Promise<void> => {
+    if (!sdk || !poolAddress || !pooltype) {
+      setManagedMembers([]);
+      setTotalMemberCount(null);
+      return;
+    }
+    // No SDK helper for DirectPayments pool membership today. The manage UI
+    // already restricts most editing to UBI (pooltype !== 'UBI' guards), so
+    // we just keep an empty/local-only list for DirectPayments and let the
+    // user's own add tx populate it optimistically.
+    if (pooltype !== UBI_POOL_TYPE) {
+      setManagedMembers([]);
+      setTotalMemberCount(null);
+      return;
+    }
 
-  // Re-seed from subgraph whenever the upstream data changes (poll refresh,
-  // route change, etc.). The local set is replaced rather than merged because
-  // the subgraph is authoritative for steady state.
-  useEffect(() => {
-    if (initialMembers === undefined) return;
-    setManagedMembers(toMemberAddresses(initialMembers));
-    setTotalMemberCount(initialMembers.length);
-  }, [initialMembers]);
-
-  // Pull the live on-chain member set for UBI pools. Only called right after
-  // the user's own add/remove tx so the UI reflects the change before the
-  // subgraph has indexed the events. Falls back to a no-op on DirectPayments
-  // pools (no SDK helper) and on read failures (we keep the optimistic state).
-  const refreshUbiMembersFromChain = useCallback(async (): Promise<void> => {
-    if (!sdk || !poolAddress || pooltype !== UBI_POOL_TYPE) return;
     try {
+      setIsLoadingMembers(true);
       const result = await sdk.getUBIPoolMembers(poolAddress);
       setManagedMembers(result.members);
       setTotalMemberCount(result.onChainCount ?? result.count);
     } catch (error) {
-      // Optimistic local state already reflects the user's intent; the next
-      // subgraph poll will reconcile if the SDK read failed.
-      console.error('Failed to refresh UBI members after tx:', error);
+      console.error('Failed to load UBI pool members:', error);
+      setManagedMembers([]);
+      setTotalMemberCount(null);
+    } finally {
+      setIsLoadingMembers(false);
     }
   }, [sdk, poolAddress, pooltype]);
+
+  useEffect(() => {
+    loadMembersFromChain();
+  }, [loadMembersFromChain]);
 
   const parsedMemberAddresses = useMemo(() => parseMemberAddresses(memberInput), [memberInput]);
 
@@ -160,16 +161,15 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId, initialMem
       const tx = await sdk.addPoolMembers(signer as any, poolAddress, validAddresses, extraData);
       await tx.wait();
 
-      // Optimistically merge the newly-added valid addresses into local state.
-      // For UBI pools we also refresh from chain so the count reflects on-chain
-      // truth even if validation skipped some addresses server-side.
+      // Optimistically merge so the new rows appear immediately, then reconcile
+      // with chain state for UBI pools.
       setManagedMembers((prev) => {
         const next = new Set(prev.map((a) => a.toLowerCase()));
         validAddresses.forEach((a) => next.add(a.toLowerCase()));
         return Array.from(next);
       });
       if (pooltype === UBI_POOL_TYPE) {
-        await refreshUbiMembersFromChain();
+        await loadMembersFromChain();
       } else {
         setTotalMemberCount((prev) => (prev ?? managedMembers.length) + validAddresses.length);
       }
@@ -212,7 +212,7 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId, initialMem
       // reconcile with chain state.
       const memberLower = member.toLowerCase();
       setManagedMembers((prev) => prev.filter((m) => m.toLowerCase() !== memberLower));
-      await refreshUbiMembersFromChain();
+      await loadMembersFromChain();
 
       setMemberSuccess('Successfully removed member.');
     } catch (e: any) {
@@ -232,6 +232,7 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId, initialMem
     removingMemberAddress,
     managedMembers,
     totalMemberCount,
+    isLoadingMembers,
     handleAddMembers,
     handleRemoveMember,
     parsedMemberAddresses,
