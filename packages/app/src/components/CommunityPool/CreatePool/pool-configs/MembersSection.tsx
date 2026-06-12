@@ -8,7 +8,7 @@ interface MembersSectionProps {
   poolRecipients: string;
   setPoolRecipients: (value: string) => void;
   onValidate: () => void;
-  onValidateRecipients: () => Promise<void>;
+  onValidateRecipients: () => Promise<boolean>;
   isCheckingRecipients: boolean;
   errors: {
     maximumMembers?: string;

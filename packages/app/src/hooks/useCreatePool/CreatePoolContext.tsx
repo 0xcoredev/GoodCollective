@@ -181,8 +181,8 @@ export const CreatePoolProvider = ({ children }: { children: ReactNode }) => {
       const { validAddresses, skippedAddresses } = await assessPoolMemberEligibility({
         provider: signer.provider as ethers.providers.Provider,
         addresses: memberAddresses,
-        uniquenessValidator: poolSettings.uniquenessValidator,
-        membersValidator: poolSettings.membersValidator,
+        uniquenessValidator: poolSettings.uniquenessValidator as string,
+        membersValidator: poolSettings.membersValidator as string,
         operatorAddress,
       });
 
