@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { GoodCollectiveSDK } from '@gooddollar/goodcollective-sdk';
-import { ethers } from 'ethers';
 import { useEthersProvider, useEthersSigner } from '../useEthers';
 import { SupportedNetwork, SupportedNetworkNames } from '../../models/constants';
+import { StewardCollective } from '../../models/models';
 import {
   assessPoolMemberEligibility,
   formatSkippedMembersMessage,
@@ -10,19 +10,28 @@ import {
 } from '../../lib/poolMemberEligibility';
 import { parseMemberAddresses, validateMemberAddresses } from '../../lib/memberAddresses';
 
+// Pool types as emitted by the subgraph factory mappings.
+// See packages/subgraph/src/mappings/poolFactory.ts.
+const UBI_POOL_TYPE = 'UBI';
+const DIRECT_PAYMENTS_POOL_TYPE = 'DirectPayments';
+
 interface UseMemberManagementParams {
   poolAddress?: string;
   pooltype?: string;
   chainId: number;
+  /**
+   * Initial member list from the subgraph (collective.stewardCollectives).
+   * Used as the source of truth for steady state; the hook only goes on-chain
+   * via sdk.getUBIPoolMembers for an immediate refresh after the user's own
+   * add/remove tx, since the subgraph takes a few seconds to index events.
+   */
+  initialMembers?: StewardCollective[];
 }
 
-type MemberLoadResult = {
-  members: string[];
-  count: number;
-  onChainCount?: number;
-};
+const toMemberAddresses = (stewards: StewardCollective[] | undefined): string[] =>
+  stewards?.map((s) => s.steward.toLowerCase()) ?? [];
 
-export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMemberManagementParams) => {
+export const useMemberManagement = ({ poolAddress, pooltype, chainId, initialMembers }: UseMemberManagementParams) => {
   const provider = useEthersProvider({ chainId });
   const signer = useEthersSigner({ chainId });
 
@@ -37,114 +46,45 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
   const [memberError, setMemberError] = useState<string | null>(null);
   const [memberSuccess, setMemberSuccess] = useState<string | null>(null);
   const [isAddingMembers, setIsAddingMembers] = useState(false);
-
   const [removingMemberAddress, setRemovingMemberAddress] = useState<string | null>(null);
 
-  const [managedMembers, setManagedMembers] = useState<string[]>([]);
-  const [totalMemberCount, setTotalMemberCount] = useState<number | null>(null);
+  const subgraphMembers = useMemo(() => toMemberAddresses(initialMembers), [initialMembers]);
 
-  const loadMembersFromChain = useCallback(async (): Promise<MemberLoadResult | null> => {
-    if (!poolAddress || !pooltype || !provider || !sdk) {
-      setManagedMembers([]);
-      setTotalMemberCount(null);
-      return null;
-    }
+  // Steady-state member list seeded from the subgraph. Add/remove flows update
+  // this locally (and refresh from chain for UBI) so the UI stays in sync
+  // between subgraph polls.
+  const [managedMembers, setManagedMembers] = useState<string[]>(subgraphMembers);
+  const [totalMemberCount, setTotalMemberCount] = useState<number | null>(
+    initialMembers ? initialMembers.length : null
+  );
 
-    if (pooltype !== 'UBI' && pooltype !== 'DIRECT') {
-      setManagedMembers([]);
-      setTotalMemberCount(null);
-      return null;
-    }
-
-    // The collective data passed down here is not a current member list.
-    // Reload member state from on-chain role data so add/remove changes survive refresh.
-    const pool =
-      pooltype === 'UBI'
-        ? sdk.ubipool.attach(poolAddress)
-        : (sdk.pool.attach(poolAddress) as ethers.Contract & {
-            MEMBER_ROLE: () => Promise<string>;
-            filters: {
-              RoleGranted: (role: string, account: string | null, sender: string | null) => ethers.EventFilter;
-              RoleRevoked: (role: string, account: string | null, sender: string | null) => ethers.EventFilter;
-            };
-          });
-
-    let onChainCount: number | undefined;
-    if (pooltype === 'UBI') {
-      try {
-        // Read membersCount separately so the UI can keep the total even if log replay fails.
-        // status() is typed by typechain (UBIPool.ts) and returns a named `membersCount` field,
-        // so we read it by name - no positional tuple indexing or fragile casts.
-        const status = await sdk.ubipool.attach(poolAddress).status();
-        const parsed = Number(status.membersCount);
-        if (Number.isFinite(parsed)) {
-          onChainCount = parsed;
-        }
-      } catch {
-        // Ignore count parsing failures and fall back to event-derived size.
-      }
-    }
-
-    try {
-      const memberRole = await pool.MEMBER_ROLE();
-      const latestBlock = await provider.getBlockNumber();
-      const fromBlock = Math.max(0, latestBlock - 9500);
-
-      // Rebuild the current member set by replaying MEMBER_ROLE grant/revoke events in chain order.
-      const granted = await pool.queryFilter(pool.filters.RoleGranted(memberRole, null, null), fromBlock, latestBlock);
-      const revoked = await pool.queryFilter(pool.filters.RoleRevoked(memberRole, null, null), fromBlock, latestBlock);
-
-      const allEvents = [...granted, ...revoked].sort((a, b) => {
-        if (a.blockNumber === b.blockNumber) {
-          return (a.logIndex || 0) - (b.logIndex || 0);
-        }
-        return a.blockNumber - b.blockNumber;
-      });
-
-      const memberSet = new Set<string>();
-
-      for (const event of allEvents) {
-        const account = (event.args?.account as string | undefined)?.toLowerCase();
-        if (!account) continue;
-
-        if (event.event === 'RoleGranted') {
-          memberSet.add(account);
-        } else if (event.event === 'RoleRevoked') {
-          memberSet.delete(account);
-        }
-      }
-
-      const members = Array.from(memberSet);
-      const nextTotal = onChainCount ?? members.length;
-
-      setManagedMembers(members);
-      setTotalMemberCount(nextTotal);
-
-      return {
-        members,
-        count: members.length,
-        ...(onChainCount !== undefined ? { onChainCount } : {}),
-      };
-    } catch (error) {
-      console.error('Failed to load pool members from chain:', error);
-      setManagedMembers([]);
-      // Keep the total count when available even if the address list cannot be rebuilt from logs.
-      setTotalMemberCount(onChainCount ?? null);
-      return {
-        members: [],
-        count: 0,
-        ...(onChainCount !== undefined ? { onChainCount } : {}),
-      };
-    }
-  }, [poolAddress, pooltype, provider, sdk]);
-
+  // Re-seed from subgraph whenever the upstream data changes (poll refresh,
+  // route change, etc.). The local set is replaced rather than merged because
+  // the subgraph is authoritative for steady state.
   useEffect(() => {
-    loadMembersFromChain();
-  }, [loadMembersFromChain]);
+    if (initialMembers === undefined) return;
+    setManagedMembers(toMemberAddresses(initialMembers));
+    setTotalMemberCount(initialMembers.length);
+  }, [initialMembers]);
 
-  const parsedMemberAddresses = useMemo(() => {
-    return parseMemberAddresses(memberInput);
-  }, [memberInput]);
+  // Pull the live on-chain member set for UBI pools. Only called right after
+  // the user's own add/remove tx so the UI reflects the change before the
+  // subgraph has indexed the events. Falls back to a no-op on DirectPayments
+  // pools (no SDK helper) and on read failures (we keep the optimistic state).
+  const refreshUbiMembersFromChain = useCallback(async (): Promise<void> => {
+    if (!sdk || !poolAddress || pooltype !== UBI_POOL_TYPE) return;
+    try {
+      const result = await sdk.getUBIPoolMembers(poolAddress);
+      setManagedMembers(result.members);
+      setTotalMemberCount(result.onChainCount ?? result.count);
+    } catch (error) {
+      // Optimistic local state already reflects the user's intent; the next
+      // subgraph poll will reconcile if the SDK read failed.
+      console.error('Failed to refresh UBI members after tx:', error);
+    }
+  }, [sdk, poolAddress, pooltype]);
+
+  const parsedMemberAddresses = useMemo(() => parseMemberAddresses(memberInput), [memberInput]);
 
   useEffect(() => {
     if (memberInput.trim() !== '') {
@@ -171,7 +111,7 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
       return;
     }
 
-    if (pooltype !== 'UBI' && pooltype !== 'DIRECT') {
+    if (pooltype !== UBI_POOL_TYPE && pooltype !== DIRECT_PAYMENTS_POOL_TYPE) {
       setMemberError('Member management is currently supported for UBI and Direct Payments pools only.');
       return;
     }
@@ -187,18 +127,9 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
 
     try {
       setIsAddingMembers(true);
-      const previousMembers = new Set(managedMembers.map((member) => member.toLowerCase()));
       const operatorAddress = (await signer.getAddress()).toLowerCase();
-      const pool =
-        pooltype === 'UBI'
-          ? sdk.ubipool.attach(poolAddress)
-          : (sdk.pool.attach(poolAddress) as ethers.Contract & {
-              settings: () => Promise<{
-                membersValidator?: string;
-                uniquenessValidator?: string;
-              }>;
-            });
-      const settings = (await pool.settings()) as {
+      const pool = pooltype === UBI_POOL_TYPE ? sdk.ubipool.attach(poolAddress) : sdk.pool.attach(poolAddress);
+      const settings = (await (pool as any).settings()) as {
         membersValidator?: string;
         uniquenessValidator?: string;
       };
@@ -216,7 +147,7 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
       if (validAddresses.length === 0) {
         const skippedSummary = formatSkippedMembersMessage(skippedAddresses);
         const fallbackReason =
-          pooltype === 'UBI' && !isZeroAddress(settings.uniquenessValidator)
+          pooltype === UBI_POOL_TYPE && !isZeroAddress(settings.uniquenessValidator)
             ? 'For this pool, members must be verified by the pool uniqueness validator before they can be added.'
             : 'None of the pasted addresses can be added to this pool.';
 
@@ -226,31 +157,30 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
       }
 
       const extraData = validAddresses.map(() => '0x');
-      // Use the SDK bulk-add flow so all valid addresses are submitted in one transaction.
       const tx = await sdk.addPoolMembers(signer as any, poolAddress, validAddresses, extraData);
       await tx.wait();
 
-      const refreshedMembers = await loadMembersFromChain();
-      const addedCount =
-        refreshedMembers?.members.filter((member) => !previousMembers.has(member.toLowerCase())).length ??
-        validAddresses.length;
-      const skippedSummary = formatSkippedMembersMessage(skippedAddresses);
-
-      setMemberInput('');
-      if (addedCount > 0) {
-        setMemberSuccess(
-          `Successfully added ${addedCount} member${addedCount !== 1 ? 's' : ''}.${
-            skippedSummary ? ` Skipped: ${skippedSummary}.` : ''
-          }`
-        );
+      // Optimistically merge the newly-added valid addresses into local state.
+      // For UBI pools we also refresh from chain so the count reflects on-chain
+      // truth even if validation skipped some addresses server-side.
+      setManagedMembers((prev) => {
+        const next = new Set(prev.map((a) => a.toLowerCase()));
+        validAddresses.forEach((a) => next.add(a.toLowerCase()));
+        return Array.from(next);
+      });
+      if (pooltype === UBI_POOL_TYPE) {
+        await refreshUbiMembersFromChain();
       } else {
-        setMemberSuccess(null);
-        setMemberError(
-          skippedSummary
-            ? `Transaction confirmed, but no new members were added. Skipped: ${skippedSummary}.`
-            : 'Transaction confirmed, but no new members were added.'
-        );
+        setTotalMemberCount((prev) => (prev ?? managedMembers.length) + validAddresses.length);
       }
+
+      const skippedSummary = formatSkippedMembersMessage(skippedAddresses);
+      setMemberInput('');
+      setMemberSuccess(
+        `Successfully added ${validAddresses.length} member${validAddresses.length !== 1 ? 's' : ''}.${
+          skippedSummary ? ` Skipped: ${skippedSummary}.` : ''
+        }`
+      );
     } catch (e: any) {
       setMemberError(e?.reason || e?.message || 'Failed to add members.');
       setMemberSuccess(null);
@@ -267,7 +197,7 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
       return;
     }
 
-    if (pooltype !== 'UBI') {
+    if (pooltype !== UBI_POOL_TYPE) {
       setMemberError('Member removal is currently supported for UBI pools only.');
       return;
     }
@@ -275,17 +205,16 @@ export const useMemberManagement = ({ poolAddress, pooltype, chainId }: UseMembe
     try {
       setRemovingMemberAddress(member);
 
-      // Use the SDK remove-member flow for the selected UBI member.
       const tx = await sdk.removeUBIPoolMember(signer as any, poolAddress, member);
       await tx.wait();
-      const refreshedMembers = await loadMembersFromChain();
-      const memberStillPresent =
-        refreshedMembers?.members.some((existingMember) => existingMember.toLowerCase() === member.toLowerCase()) ??
-        false;
 
-      setMemberSuccess(
-        memberStillPresent ? 'Transaction confirmed. Member list refreshed.' : 'Successfully removed member.'
-      );
+      // Optimistic local removal so the row disappears immediately, then
+      // reconcile with chain state.
+      const memberLower = member.toLowerCase();
+      setManagedMembers((prev) => prev.filter((m) => m.toLowerCase() !== memberLower));
+      await refreshUbiMembersFromChain();
+
+      setMemberSuccess('Successfully removed member.');
     } catch (e: any) {
       setMemberError(e?.reason || e?.message || 'Failed to remove member.');
       setMemberSuccess(null);
